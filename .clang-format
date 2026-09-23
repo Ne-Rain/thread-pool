@@ -1,0 +1,12 @@
+Language:  Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+AccessModifierOffset: -4 # -4就是public顶格
+AlwaysBreakTemplateDeclarations: true # template <typename T>单独一行
+UseTab: false
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: false
+ColumnLimit: 100
+SpacesBeforeTrailingComments: 1
+IndentCaseLabels: false
+PointerBindsToType: true
