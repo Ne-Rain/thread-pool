@@ -63,6 +63,7 @@ void test_3() {
     ThreadPool pool(2);
     auto handle = pool.submit_with_handle([]() { return 123; });
     assert(handle.get() == 123);
+    assert(!handle.valid());
     assert(!handle.is_cancelled());
 }
 
@@ -95,6 +96,8 @@ void test_5() {
         assert(false);
     } catch (const TaskCancelledException&) {
     }
+    pool.wait_for_tasks();
+    assert(pool.get_tasks_total() == 0);
 }
 
 void test_6() {
