@@ -46,6 +46,7 @@ aux_source_directory(
 add_executable(
     thread_pool_test
     tests/unit/cancel_test.cpp
+    tests/stress/submit_stress_test.cpp
     ${SRC_LIST}
 )
 target_include_directories(

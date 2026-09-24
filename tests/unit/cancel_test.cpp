@@ -46,7 +46,7 @@ TEST(TaskCancelTest, TestWorker) {
     }
     bool result = handle.cancel();
     EXPECT_FALSE(result);
-    EXPECT_TRUE(!handle.is_cancelled());
+    EXPECT_FALSE(handle.is_cancelled());
     {
         std::unique_lock<std::mutex> lock(mtx);
         can_finish = true;
@@ -59,15 +59,15 @@ TEST(TaskCancelTest, TestRun) {
     ThreadPool pool(2);
     auto handle = pool.submit_with_handle([]() { return 123; });
     EXPECT_EQ(handle.get(), 123);
-    EXPECT_TRUE(!handle.valid());
-    EXPECT_TRUE(!handle.is_cancelled());
+    EXPECT_FALSE(handle.valid());
+    EXPECT_FALSE(handle.is_cancelled());
 }
 
-TEST(TaskCacelTest, TestException) {
+TEST(TaskCancelTest, TestException) {
     ThreadPool pool(1);
     auto handle = pool.submit_with_handle([]() -> int { throw std::runtime_error("boom"); });
     EXPECT_THROW(handle.get(), std::runtime_error);
-    EXPECT_TRUE(!handle.is_cancelled());
+    EXPECT_FALSE(handle.is_cancelled());
 }
 
 TEST(TaskCancelTest, TestPurge) {
