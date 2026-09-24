@@ -59,8 +59,50 @@ target_link_libraries(
     GTest::gtest_main
     pthread
 )
+
+
+
 enable_testing()
 include(GoogleTest)
 gtest_discover_tests(
     thread_pool_test
+    DISCOVERY_MODE PRE_TEST
 )
+
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(ENABLE_TSAN)
+    target_compile_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=thread
+        -g
+        -O1
+        -fno-omit-frame-pointer
+    )
+
+    target_link_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=thread
+    )
+endif()
+
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+if(ENABLE_ASAN)
+    target_compile_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=address
+        -g
+        -O1
+        -fno-omit-frame-pointer
+    )
+
+    target_link_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=address
+    )
+endif()
