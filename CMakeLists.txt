@@ -69,8 +69,8 @@ gtest_discover_tests(
     DISCOVERY_MODE PRE_TEST
 )
 
+# TSAN
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
-
 if(ENABLE_TSAN)
     target_compile_options(
         thread_pool_test
@@ -88,8 +88,8 @@ if(ENABLE_TSAN)
     )
 endif()
 
+# ASAN
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
-
 if(ENABLE_ASAN)
     target_compile_options(
         thread_pool_test
@@ -104,5 +104,25 @@ if(ENABLE_ASAN)
         thread_pool_test
         PRIVATE
         -fsanitize=address
+    )
+endif()
+
+# UBSAN
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+if(ENABLE_UBSAN)
+    target_compile_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=undefined
+        -fno-sanitize-recover=undefined
+        -g
+        -O1
+        -fno-omit-frame-pointer
+    )
+
+    target_link_options(
+        thread_pool_test
+        PRIVATE
+        -fsanitize=undefined
     )
 endif()
