@@ -3,17 +3,50 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
-#include <string>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
 
-const std::size_t TASK_COUNT = 100000;
-const std::size_t WARMUP_TASK_COUNT = 1000;
-const std::size_t ROUNDS = 10;
+const std::size_t TASK_COUNT = 1000;
+const std::size_t WORK_PER_TASK = 100000;
+const std::size_t ROUNDS = 5;
+const std::size_t WARMUP_TASKS = 100;
+
+/*
+ * 一个纯 CPU-bound 任务。
+ *
+ * 特点：
+ * 1. 没有 mutex
+ * 2. 没有 sleep
+ * 3. 没有 IO
+ * 4. 没有动态内存分配
+ * 5. 每个任务完全独立
+ *
+ * uint64_t 的溢出是有定义的，
+ * 不会引入 signed overflow UB。
+ */
+std::uint64_t cpu_work(std::uint64_t seed) {
+    std::uint64_t x = seed + 0x9e3779b97f4a7c15ULL;
+
+    for (std::size_t i = 0; i < WORK_PER_TASK; ++i) {
+
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+
+        x *= 2685821657736338717ULL;
+
+        x += static_cast<std::uint64_t>(i) + 0x9e3779b97f4a7c15ULL;
+    }
+
+    return x;
+}
 
 double median(std::vector<double> values) {
     std::sort(values.begin(), values.end());
@@ -24,360 +57,201 @@ double median(std::vector<double> values) {
         return values[n / 2];
     }
 
-    return (values[n / 2 - 1] +
-            values[n / 2]) /
-           2.0;
+    return (values[n / 2 - 1] + values[n / 2]) / 2.0;
 }
 
 double average(const std::vector<double>& values) {
-    const double total =
-        std::accumulate(
-            values.begin(),
-            values.end(),
-            0.0);
 
-    return total /
-           static_cast<double>(values.size());
+    const double total = std::accumulate(values.begin(), values.end(), 0.0);
+
+    return total / static_cast<double>(values.size());
+}
+
+/*
+ * 防止编译器认为计算结果没有用途。
+ *
+ * 同时后面也可以利用 checksum
+ * 验证并行版本和串行版本计算结果一致。
+ */
+std::uint64_t checksum(const std::vector<std::uint64_t>& results) {
+
+    std::uint64_t value = 0;
+
+    for (std::size_t i = 0; i < results.size(); ++i) {
+
+        value ^= results[i] + 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
+    }
+
+    return value;
 }
 
 void warm_up(ThreadPool& pool) {
-    for (std::size_t i = 0;
-         i < WARMUP_TASK_COUNT;
-         ++i) {
+    for (std::size_t i = 0; i < WARMUP_TASKS; ++i) {
+
         pool.submit([]() {});
     }
 
     pool.wait_for_tasks();
 }
 
-void print_summary(
-    const std::string& name,
-    std::size_t workers,
-    const std::vector<double>& times) {
-
-    const double average_time =
-        average(times);
-
-    const double median_time =
-        median(times);
-
-    const double average_throughput =
-        static_cast<double>(TASK_COUNT) /
-        average_time;
-
-    const double median_throughput =
-        static_cast<double>(TASK_COUNT) /
-        median_time;
-
-    std::cout
-        << "\n"
-        << name
-        << " summary"
-        << "\nworkers = "
-        << workers
-        << '\n'
-        << "average time       = "
-        << average_time
-        << " s\n"
-        << "median time        = "
-        << median_time
-        << " s\n"
-        << "average throughput = "
-        << average_throughput
-        << " tasks/s\n"
-        << "median throughput  = "
-        << median_throughput
-        << " tasks/s\n";
-}
-
 /*
- * 1. End-to-end
- *
- * 测量：
- *
- * submit
- *   +
- * enqueue
- *   +
- * worker dequeue
- *   +
- * task execution
- *   +
- * wait_for_tasks
+ * 串行基线
  */
-std::vector<double>
-benchmark_end_to_end(std::size_t workers) {
+std::vector<double> benchmark_serial(std::uint64_t& expected_checksum) {
+
     std::vector<double> times;
     times.reserve(ROUNDS);
 
-    for (std::size_t round = 0;
-         round < ROUNDS;
-         ++round) {
+    for (std::size_t round = 0; round < ROUNDS; ++round) {
 
-        ThreadPool pool(workers);
+        std::vector<std::uint64_t> results(TASK_COUNT);
 
-        warm_up(pool);
+        const auto start = std::chrono::steady_clock::now();
 
-        const auto start =
-            std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < TASK_COUNT; ++i) {
 
-        for (std::size_t i = 0;
-             i < TASK_COUNT;
-             ++i) {
-
-            pool.submit([]() {});
+            results[i] = cpu_work(static_cast<std::uint64_t>(i + 1));
         }
 
-        pool.wait_for_tasks();
+        const auto end = std::chrono::steady_clock::now();
 
-        const auto end =
-            std::chrono::steady_clock::now();
-
-        const double seconds =
-            std::chrono::duration<double>(
-                end - start)
-                .count();
+        const double seconds = std::chrono::duration<double>(end - start).count();
 
         times.push_back(seconds);
 
-        std::cout
-            << "EndToEnd"
-            << " workers=" << workers
-            << " round=" << (round + 1)
-            << " time=" << seconds
-            << " s\n";
+        const std::uint64_t current_checksum = checksum(results);
+
+        if (round == 0) {
+            expected_checksum = current_checksum;
+        } else if (current_checksum != expected_checksum) {
+
+            throw std::runtime_error("serial checksum mismatch");
+        }
+
+        std::cout << "Serial" << " round=" << (round + 1) << " time=" << seconds << " s\n";
     }
 
     return times;
 }
 
 /*
- * 2. Enqueue-only
- *
- * pool.pause() 后 worker 不会消费任务。
- *
- * 所以计时区间主要包含：
- *
- * submit
- *   ↓
- * packaged_task / future
- *   ↓
- * std::function
- *   ↓
- * mutex
- *   ↓
- * priority_queue::push
- *
- * resume + drain 不计入时间。
+ * ThreadPool CPU benchmark
  */
-std::vector<double>
-benchmark_enqueue_only(std::size_t workers) {
+std::vector<double> benchmark_thread_pool(std::size_t workers, std::uint64_t expected_checksum) {
+
     std::vector<double> times;
     times.reserve(ROUNDS);
 
-    for (std::size_t round = 0;
-         round < ROUNDS;
-         ++round) {
+    for (std::size_t round = 0; round < ROUNDS; ++round) {
 
         ThreadPool pool(workers);
-
-        warm_up(pool);
-
-        pool.pause();
-
-        const auto start =
-            std::chrono::steady_clock::now();
-
-        for (std::size_t i = 0;
-             i < TASK_COUNT;
-             ++i) {
-
-            pool.submit([]() {});
-        }
-
-        const auto end =
-            std::chrono::steady_clock::now();
-
-        const double seconds =
-            std::chrono::duration<double>(
-                end - start)
-                .count();
-
-        times.push_back(seconds);
 
         /*
-         * 清理本轮任务。
-         *
-         * 注意：
-         * 这两步必须放在计时结束之后，
-         * 否则就不再是 enqueue-only。
+         * 只确保 worker 已经真正启动。
+         * warm-up 不进入正式计时。
          */
-        pool.resume();
+        warm_up(pool);
+
+        std::vector<std::uint64_t> results(TASK_COUNT);
+
+        const auto start = std::chrono::steady_clock::now();
+
+        for (std::size_t i = 0; i < TASK_COUNT; ++i) {
+
+            pool.submit(
+                [i, &results]() { results[i] = cpu_work(static_cast<std::uint64_t>(i + 1)); });
+        }
+
         pool.wait_for_tasks();
 
-        std::cout
-            << "EnqueueOnly"
-            << " workers=" << workers
-            << " round=" << (round + 1)
-            << " time=" << seconds
-            << " s\n";
+        const auto end = std::chrono::steady_clock::now();
+
+        const double seconds = std::chrono::duration<double>(end - start).count();
+
+        times.push_back(seconds);
+
+        const std::uint64_t current_checksum = checksum(results);
+
+        if (current_checksum != expected_checksum) {
+
+            throw std::runtime_error("parallel checksum mismatch");
+        }
+
+        std::cout << "ThreadPool" << " workers=" << workers << " round=" << (round + 1)
+                  << " time=" << seconds << " s\n";
     }
 
     return times;
 }
 
-/*
- * 3. Drain-only
- *
- * 先暂停 pool，
- * 把所有任务提前放进队列。
- *
- * 正式计时只包含：
- *
- * resume
- *   ↓
- * workers竞争队列
- *   ↓
- * dequeue
- *   ↓
- * 执行空任务
- *   ↓
- * running_tasks_维护
- *   ↓
- * wait_for_tasks
- */
-std::vector<double>
-benchmark_drain_only(std::size_t workers) {
-    std::vector<double> times;
-    times.reserve(ROUNDS);
+void print_pool_summary(std::size_t workers, const std::vector<double>& times,
+                        double serial_median) {
 
-    for (std::size_t round = 0;
-         round < ROUNDS;
-         ++round) {
+    const double average_time = average(times);
 
-        ThreadPool pool(workers);
+    const double median_time = median(times);
 
-        warm_up(pool);
+    const double speedup = serial_median / median_time;
 
-        pool.pause();
+    const double efficiency = speedup / static_cast<double>(workers);
 
-        /*
-         * 提前准备好所有任务。
-         * 这一段不计时。
-         */
-        for (std::size_t i = 0;
-             i < TASK_COUNT;
-             ++i) {
+    const double throughput = static_cast<double>(TASK_COUNT) / median_time;
 
-            pool.submit([]() {});
-        }
+    std::cout << "\nThreadPool summary\n"
+              << "workers            = " << workers << '\n'
 
-        const auto start =
-            std::chrono::steady_clock::now();
+              << "average time       = " << average_time << " s\n"
 
-        pool.resume();
-        pool.wait_for_tasks();
+              << "median time        = " << median_time << " s\n"
 
-        const auto end =
-            std::chrono::steady_clock::now();
+              << "throughput         = " << throughput << " tasks/s\n"
 
-        const double seconds =
-            std::chrono::duration<double>(
-                end - start)
-                .count();
+              << "speedup            = " << speedup << "x\n"
 
-        times.push_back(seconds);
-
-        std::cout
-            << "DrainOnly"
-            << " workers=" << workers
-            << " round=" << (round + 1)
-            << " time=" << seconds
-            << " s\n";
-    }
-
-    return times;
+              << "parallel efficiency= " << efficiency * 100.0 << "%\n";
 }
 
 } // namespace
 
 int main() {
-    const std::vector<std::size_t>
-        worker_counts{
-            1,
-            2,
-            4,
-            8
-        };
+    const std::vector<std::size_t> worker_counts{1, 2, 4, 8, 12, 16, 24, 32};
 
-    std::cout
-        << std::fixed
-        << std::setprecision(6);
+    std::cout << std::fixed << std::setprecision(6);
+
+    std::cout << "hardware_concurrency = " << std::thread::hardware_concurrency() << "\n";
+
+    std::cout << "task_count           = " << TASK_COUNT << "\n";
+
+    std::cout << "work_per_task        = " << WORK_PER_TASK << "\n\n";
 
     /*
-     * 第一组：
-     * End-to-end
+     * 先测真正的串行版本。
      */
-    std::cout
-        << "\n"
-        << "========================================\n"
-        << "END-TO-END BENCHMARK\n"
-        << "========================================\n";
+    std::uint64_t expected_checksum = 0;
 
-    for (std::size_t workers :
-         worker_counts) {
+    const std::vector<double> serial_times = benchmark_serial(expected_checksum);
 
-        const std::vector<double> times =
-            benchmark_end_to_end(workers);
+    const double serial_average = average(serial_times);
 
-        print_summary(
-            "EndToEnd",
-            workers,
-            times);
-    }
+    const double serial_median = median(serial_times);
+
+    std::cout << "\nSerial summary\n"
+              << "average time = " << serial_average << " s\n"
+              << "median time  = " << serial_median << " s\n"
+              << "checksum     = " << expected_checksum << "\n";
 
     /*
-     * 第二组：
-     * Enqueue-only
+     * 再测不同 worker 数。
      */
-    std::cout
-        << "\n"
-        << "========================================\n"
-        << "ENQUEUE-ONLY BENCHMARK\n"
-        << "========================================\n";
+    for (std::size_t workers : worker_counts) {
 
-    for (std::size_t workers :
-         worker_counts) {
+        std::cout << "\n========================================\n"
+                  << "workers = " << workers << "\n"
+                  << "========================================\n";
 
-        const std::vector<double> times =
-            benchmark_enqueue_only(workers);
+        const std::vector<double> times = benchmark_thread_pool(workers, expected_checksum);
 
-        print_summary(
-            "EnqueueOnly",
-            workers,
-            times);
-    }
-
-    /*
-     * 第三组：
-     * Drain-only
-     */
-    std::cout
-        << "\n"
-        << "========================================\n"
-        << "DRAIN-ONLY BENCHMARK\n"
-        << "========================================\n";
-
-    for (std::size_t workers :
-         worker_counts) {
-
-        const std::vector<double> times =
-            benchmark_drain_only(workers);
-
-        print_summary(
-            "DrainOnly",
-            workers,
-            times);
+        print_pool_summary(workers, times, serial_median);
     }
 
     return 0;
