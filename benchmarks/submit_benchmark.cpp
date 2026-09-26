@@ -8,33 +8,25 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 namespace {
 
-const std::size_t TASK_COUNT = 1000;
-const std::size_t WORK_PER_TASK = 100000;
+const std::size_t WORKERS = 16;
+const std::size_t TOTAL_WORK = 100000000;
 const std::size_t ROUNDS = 5;
 const std::size_t WARMUP_TASKS = 100;
 
-/*
- * 一个纯 CPU-bound 任务。
- *
- * 特点：
- * 1. 没有 mutex
- * 2. 没有 sleep
- * 3. 没有 IO
- * 4. 没有动态内存分配
- * 5. 每个任务完全独立
- *
- * uint64_t 的溢出是有定义的，
- * 不会引入 signed overflow UB。
- */
-std::uint64_t cpu_work(std::uint64_t seed) {
+struct BenchmarkCase {
+    std::size_t task_count;
+    std::size_t work_per_task;
+};
+
+std::uint64_t cpu_work(std::uint64_t seed, std::size_t work_count) {
+
     std::uint64_t x = seed + 0x9e3779b97f4a7c15ULL;
 
-    for (std::size_t i = 0; i < WORK_PER_TASK; ++i) {
+    for (std::size_t i = 0; i < work_count; ++i) {
 
         x ^= x >> 12;
         x ^= x << 25;
@@ -48,7 +40,15 @@ std::uint64_t cpu_work(std::uint64_t seed) {
     return x;
 }
 
+double average(const std::vector<double>& values) {
+
+    const double total = std::accumulate(values.begin(), values.end(), 0.0);
+
+    return total / static_cast<double>(values.size());
+}
+
 double median(std::vector<double> values) {
+
     std::sort(values.begin(), values.end());
 
     const std::size_t n = values.size();
@@ -60,19 +60,6 @@ double median(std::vector<double> values) {
     return (values[n / 2 - 1] + values[n / 2]) / 2.0;
 }
 
-double average(const std::vector<double>& values) {
-
-    const double total = std::accumulate(values.begin(), values.end(), 0.0);
-
-    return total / static_cast<double>(values.size());
-}
-
-/*
- * 防止编译器认为计算结果没有用途。
- *
- * 同时后面也可以利用 checksum
- * 验证并行版本和串行版本计算结果一致。
- */
 std::uint64_t checksum(const std::vector<std::uint64_t>& results) {
 
     std::uint64_t value = 0;
@@ -95,22 +82,26 @@ void warm_up(ThreadPool& pool) {
 }
 
 /*
- * 串行基线
+ * 串行执行。
+ *
+ * 每种任务粒度都单独测一遍，
+ * 用来得到这一组 workload 的串行基线。
  */
-std::vector<double> benchmark_serial(std::uint64_t& expected_checksum) {
+std::vector<double> benchmark_serial(const BenchmarkCase& benchmark_case,
+                                     std::uint64_t& expected_checksum) {
 
     std::vector<double> times;
     times.reserve(ROUNDS);
 
     for (std::size_t round = 0; round < ROUNDS; ++round) {
 
-        std::vector<std::uint64_t> results(TASK_COUNT);
+        std::vector<std::uint64_t> results(benchmark_case.task_count);
 
         const auto start = std::chrono::steady_clock::now();
 
-        for (std::size_t i = 0; i < TASK_COUNT; ++i) {
+        for (std::size_t i = 0; i < benchmark_case.task_count; ++i) {
 
-            results[i] = cpu_work(static_cast<std::uint64_t>(i + 1));
+            results[i] = cpu_work(static_cast<std::uint64_t>(i + 1), benchmark_case.work_per_task);
         }
 
         const auto end = std::chrono::steady_clock::now();
@@ -127,39 +118,36 @@ std::vector<double> benchmark_serial(std::uint64_t& expected_checksum) {
 
             throw std::runtime_error("serial checksum mismatch");
         }
-
-        std::cout << "Serial" << " round=" << (round + 1) << " time=" << seconds << " s\n";
     }
 
     return times;
 }
 
 /*
- * ThreadPool CPU benchmark
+ * 固定 16 workers，
+ * 只改变 task_count / work_per_task。
  */
-std::vector<double> benchmark_thread_pool(std::size_t workers, std::uint64_t expected_checksum) {
+std::vector<double> benchmark_thread_pool(const BenchmarkCase& benchmark_case,
+                                          std::uint64_t expected_checksum) {
 
     std::vector<double> times;
     times.reserve(ROUNDS);
 
     for (std::size_t round = 0; round < ROUNDS; ++round) {
 
-        ThreadPool pool(workers);
+        ThreadPool pool(WORKERS);
 
-        /*
-         * 只确保 worker 已经真正启动。
-         * warm-up 不进入正式计时。
-         */
         warm_up(pool);
 
-        std::vector<std::uint64_t> results(TASK_COUNT);
+        std::vector<std::uint64_t> results(benchmark_case.task_count);
 
         const auto start = std::chrono::steady_clock::now();
 
-        for (std::size_t i = 0; i < TASK_COUNT; ++i) {
+        for (std::size_t i = 0; i < benchmark_case.task_count; ++i) {
 
-            pool.submit(
-                [i, &results]() { results[i] = cpu_work(static_cast<std::uint64_t>(i + 1)); });
+            pool.submit([i, &results, work_per_task = benchmark_case.work_per_task]() {
+                results[i] = cpu_work(static_cast<std::uint64_t>(i + 1), work_per_task);
+            });
         }
 
         pool.wait_for_tasks();
@@ -176,82 +164,79 @@ std::vector<double> benchmark_thread_pool(std::size_t workers, std::uint64_t exp
 
             throw std::runtime_error("parallel checksum mismatch");
         }
-
-        std::cout << "ThreadPool" << " workers=" << workers << " round=" << (round + 1)
-                  << " time=" << seconds << " s\n";
     }
 
     return times;
 }
 
-void print_pool_summary(std::size_t workers, const std::vector<double>& times,
-                        double serial_median) {
-
-    const double average_time = average(times);
-
-    const double median_time = median(times);
-
-    const double speedup = serial_median / median_time;
-
-    const double efficiency = speedup / static_cast<double>(workers);
-
-    const double throughput = static_cast<double>(TASK_COUNT) / median_time;
-
-    std::cout << "\nThreadPool summary\n"
-              << "workers            = " << workers << '\n'
-
-              << "average time       = " << average_time << " s\n"
-
-              << "median time        = " << median_time << " s\n"
-
-              << "throughput         = " << throughput << " tasks/s\n"
-
-              << "speedup            = " << speedup << "x\n"
-
-              << "parallel efficiency= " << efficiency * 100.0 << "%\n";
-}
-
-} // namespace
-
-int main() {
-    const std::vector<std::size_t> worker_counts{1, 2, 4, 8, 12, 16, 24, 32};
-
-    std::cout << std::fixed << std::setprecision(6);
-
-    std::cout << "hardware_concurrency = " << std::thread::hardware_concurrency() << "\n";
-
-    std::cout << "task_count           = " << TASK_COUNT << "\n";
-
-    std::cout << "work_per_task        = " << WORK_PER_TASK << "\n\n";
-
-    /*
-     * 先测真正的串行版本。
-     */
-    std::uint64_t expected_checksum = 0;
-
-    const std::vector<double> serial_times = benchmark_serial(expected_checksum);
+void print_summary(const BenchmarkCase& benchmark_case, const std::vector<double>& serial_times,
+                   const std::vector<double>& pool_times) {
 
     const double serial_average = average(serial_times);
 
     const double serial_median = median(serial_times);
 
-    std::cout << "\nSerial summary\n"
-              << "average time = " << serial_average << " s\n"
-              << "median time  = " << serial_median << " s\n"
-              << "checksum     = " << expected_checksum << "\n";
+    const double pool_average = average(pool_times);
 
+    const double pool_median = median(pool_times);
+
+    const double speedup = serial_median / pool_median;
+
+    const double efficiency = speedup / static_cast<double>(WORKERS);
+
+    const double task_rate = static_cast<double>(benchmark_case.task_count) / pool_median;
+
+    std::cout << "\n========================================\n"
+              << "task_count    = " << benchmark_case.task_count << '\n'
+              << "work_per_task = " << benchmark_case.work_per_task << '\n'
+              << "total_work    = " << benchmark_case.task_count * benchmark_case.work_per_task
+              << '\n'
+              << "----------------------------------------\n"
+              << "serial average = " << serial_average << " s\n"
+              << "serial median  = " << serial_median << " s\n"
+              << '\n'
+              << "pool average   = " << pool_average << " s\n"
+              << "pool median    = " << pool_median << " s\n"
+              << '\n'
+              << "speedup        = " << speedup << "x\n"
+              << "efficiency     = " << efficiency * 100.0 << "%\n"
+              << "task rate      = " << task_rate << " tasks/s\n";
+}
+
+} // namespace
+
+int main() {
     /*
-     * 再测不同 worker 数。
+     * 每组：
+     *
+     * task_count * work_per_task
+     * = 100,000,000
+     *
+     * 所以总 CPU 工作量基本保持一致。
      */
-    for (std::size_t workers : worker_counts) {
+    const std::vector<BenchmarkCase> cases{{100000, 1000}, {10000, 10000}, {1000, 100000},
+                                           {100, 1000000}, {16, 6250000},  {8, 12500000}};
 
-        std::cout << "\n========================================\n"
-                  << "workers = " << workers << "\n"
-                  << "========================================\n";
+    std::cout << std::fixed << std::setprecision(6);
 
-        const std::vector<double> times = benchmark_thread_pool(workers, expected_checksum);
+    std::cout << "workers    = " << WORKERS << '\n' << "total work = " << TOTAL_WORK << '\n';
 
-        print_pool_summary(workers, times, serial_median);
+    for (const BenchmarkCase& benchmark_case : cases) {
+
+        if (benchmark_case.task_count * benchmark_case.work_per_task != TOTAL_WORK) {
+
+            throw std::runtime_error("invalid benchmark case");
+        }
+
+        std::uint64_t expected_checksum = 0;
+
+        const std::vector<double> serial_times =
+            benchmark_serial(benchmark_case, expected_checksum);
+
+        const std::vector<double> pool_times =
+            benchmark_thread_pool(benchmark_case, expected_checksum);
+
+        print_summary(benchmark_case, serial_times, pool_times);
     }
 
     return 0;
