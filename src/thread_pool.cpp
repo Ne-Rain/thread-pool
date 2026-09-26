@@ -50,31 +50,43 @@ void ThreadPool::shutdown() {
     }
 }
 
-void ThreadPool::enqueue(std::function<void()> task, int priority,
-                         std::shared_ptr<TaskState> state) {
+void ThreadPool::enqueue(
+    std::function<void()> task,
+    int priority,
+    std::shared_ptr<TaskState> state) {
+
     if (!task) {
-        throw std::invalid_argument("task must not be empty");
+        throw std::invalid_argument(
+            "task must not be empty");
     }
+
     Task t{};
+    bool should_notify = false;
 
     {
         std::unique_lock<std::mutex> lock(mtx);
 
         if (state_ == State::Draining) {
-            throw std::runtime_error("cannot enqueue task into a stopping thread pool");
+            throw std::runtime_error(
+                "cannot enqueue task into a stopping thread pool");
         } else if (state_ == State::Stopped) {
-            throw std::runtime_error("cannot enqueue task into a stopped thread pool");
+            throw std::runtime_error(
+                "cannot enqueue task into a stopped thread pool");
         }
+
         t.tasks_ = std::move(task);
         t.state_ = std::move(state);
         t.priority = priority;
-        t.sequence = sequence_;
-        sequence_++;
+        t.sequence = sequence_++;
 
         tasks_.push(std::move(t));
+
+        should_notify = !paused_;
     }
 
-    cv.notify_one();
+    if (should_notify) {  // pause状态不需要通知worker
+        cv.notify_one();
+    }
 }
 
 void ThreadPool::wait_for_tasks() {
